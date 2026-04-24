@@ -1,0 +1,115 @@
+name: PipeProbe — LLM Regression Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * *"   # daily drift detection
+
+jobs:
+  # ── Fast checks first ──────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install ruff
+      - run: ruff check pipeprobe/
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -v --cov=pipeprobe --cov-report=term-missing
+
+  # ── LLM eval — only on push to main or schedule (saves API credits) ───────
+  probe:
+    name: LLM Regression Probe
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -e ".[all]"
+
+      # ── Run the probe suite ───────────────────────────────────────────────
+      - name: Run probe suite
+        run: |
+          pipeprobe run probes/dbt_rag.yaml \
+            --html \
+            --html-out pipeprobe-report.html
+        # Exit code 1 when regressions detected → blocks merge ✓
+
+      # ── Upload HTML report as artifact ────────────────────────────────────
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pipeprobe-report-${{ github.sha }}
+          path: |
+            pipeprobe-report.html
+            .pipeprobe/
+          retention-days: 90
+
+      # ── Post PR comment with results ──────────────────────────────────────
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const files = fs.readdirSync('.pipeprobe/')
+                           .filter(f => f.endsWith('.json'))
+                           .sort();
+            if (!files.length) return;
+            const run = JSON.parse(
+              fs.readFileSync(`.pipeprobe/${files[files.length-1]}`)
+            );
+            const icon   = run.failed === 0 ? '✅' : '❌';
+            const regIcon= run.regression_count > 0 ? '🔴' : '🟢';
+            const body   = `## ${icon} PipeProbe Results
+            | Metric | Value |
+            |--------|-------|
+            | Pass rate | ${(run.pass_rate * 100).toFixed(1)}% |
+            | Avg score | ${run.avg_score.toFixed(3)} |
+            | Passed | ${run.passed} / ${run.total} |
+            | ${regIcon} Regressions | ${run.regression_count} |
+            | Run ID | \`${run.run_id}\` |
+            | Branch | \`${run.git_branch}\` |
+
+            ${run.regression_count > 0 ? '> ⚠️ **Deployment blocked** — quality regression detected. Fix before merging.' : '> ✅ No regressions detected.'}
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      # ── Slack alert on regression ─────────────────────────────────────────
+      - name: Slack regression alert
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python -c "
+          from pipeprobe.reporters.slack_notifier import SlackNotifier
+          import json, glob
+          files = sorted(glob.glob('.pipeprobe/*.json'))
+          if not files: exit()
+          with open(files[-1]) as f: data = json.load(f)
+          print(f'Regression alert: {data[\"regression_count\"]} regressions in {data[\"suite_name\"]}')
+          "

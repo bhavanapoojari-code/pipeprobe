@@ -1,0 +1,83 @@
+# PipeProbe — dbt RAG quality suite
+# Run: pipeprobe run probes/dbt_rag.yaml --reasoning --html
+
+name: dbt-rag-quality
+
+judge:
+  provider: claude
+  model: claude-sonnet-4-6
+  thresholds:
+    faithfulness:     0.85   # zero hallucination tolerance in data systems
+    correctness:      0.75
+    domain_relevance: 0.70
+    actionability:    0.65
+
+regression_threshold: 0.05   # flag if any score drops >= 5%
+fail_on_regression: true
+
+# Your AI system — fill in after `pipeprobe init`
+ai_module: probes/my_ai.py
+ai_function: run
+
+cases:
+  - id: lineage-001
+    domain: dbt
+    question: "Which models write to the orders table, in upstream-to-downstream order?"
+    expected: "stg_orders → int_orders → fct_orders"
+    tags: [lineage, critical]
+    context:
+      dbt_manifest_excerpt:
+        fct_orders:  {depends_on: [int_orders]}
+        int_orders:  {depends_on: [stg_orders]}
+        stg_orders:  {depends_on: [raw_orders]}
+
+  - id: test-failure-001
+    domain: dbt
+    question: "Which dbt test is failing and what is the likely root cause?"
+    expected: >
+      The not_null test on fct_orders.order_id is failing.
+      Root cause: NULL values introduced in int_orders transformation
+      where the LEFT JOIN produces unmatched rows.
+    tags: [diagnosis, critical]
+    context:
+      failing_tests:
+        - test_name: not_null_fct_orders_order_id
+          model: fct_orders
+          column: order_id
+          failures: 143
+          status: fail
+      int_orders_sql: >
+        SELECT o.order_id, c.customer_id
+        FROM stg_orders o
+        LEFT JOIN stg_customers c ON o.customer_id = c.id
+
+  - id: airflow-schedule-001
+    domain: airflow
+    question: "What time does the orders_daily DAG run and in which timezone?"
+    expected: "orders_daily runs at 6:00 AM UTC daily (cron: '0 6 * * *')"
+    tags: [airflow, schedule]
+    context:
+      dag_config:
+        dag_id: orders_daily
+        schedule_interval: "0 6 * * *"
+        timezone: UTC
+        catchup: false
+
+  - id: sql-optimize-001
+    domain: sql
+    question: "How should I optimize this slow query on the orders table?"
+    expected: >
+      1. Replace the correlated subquery with a JOIN.
+      2. Add a composite index on (customer_id, region).
+      3. Avoid SELECT * — specify only needed columns.
+      Estimated improvement: 60–80% query time reduction.
+    tags: [sql, optimization]
+    context:
+      slow_query: >
+        SELECT * FROM orders
+        WHERE customer_id IN (SELECT id FROM customers WHERE region = 'US')
+      explain_plan:
+        full_table_scan: true
+        estimated_rows: 4500000
+      table_stats:
+        orders_row_count: 45000000

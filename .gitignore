@@ -1,0 +1,32 @@
+# PipeProbe run history (regression baseline)
+.pipeprobe/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Env
+.env
+.venv
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Reports
+pipeprobe-report.html
+
+# OS
+.DS_Store
+Thumbs.db
